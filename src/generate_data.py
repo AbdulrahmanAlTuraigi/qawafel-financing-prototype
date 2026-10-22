@@ -39,7 +39,7 @@ COMPANY = {
 }
 
 REQUEST = {
-    "amount_sar": 1_200_000,
+    "amount_sar": 750_000,
     "term_months": 12,
     "purpose": "Working capital to stock up before Ramadan 2027 (stock purchases Dec 2026 to Jan 2027)",
 }
@@ -249,7 +249,7 @@ def build_bank(df_true):
     for y, m in months():
         # ASSUMPTION: goods cost ~80% of net sales (thin margins are normal in food wholesale). Suppliers give ~30 days, so last
         # month's purchases are paid this month (plus 15% input VAT), to ~6 suppliers.
-        cogs_gross = prev_net * 0.80 * (1 + VAT_RATE)
+        cogs_gross = prev_net * 0.73 * (1 + VAT_RATE)
         for k in range(6):
             add(date(y, m, rng.randint(1, 28)), f"OUTGOING TRF {['DAIRY SUPPLIER A', 'RICE IMPORTER B', 'COOKING OIL SUPPLIER C', 'POULTRY SUPPLIER D', 'SPICES SUPPLIER E', 'PACKAGING SUPPLIER F'][k]}", -cogs_gross / 6 * rng.uniform(0.85, 1.15), "supplier")
         prev_net = net_rev(y, m)
@@ -261,7 +261,7 @@ def build_bank(df_true):
             # Net VAT for the previous quarter = 15% of (sales - purchases) ~ 15% x 20% of net sales.
             add(date(y, m, 28), "ZATCA VAT PAYMENT", -prev_net * 3 * VAT_RATE * 0.20, "tax")
         if date(y, m, 1) >= date(2026, 2, 1):
-            add(date(y, m, 12), "FINANCE INSTALLMENT - WORKING CAPITAL FACILITY", -36_000, "loan_repayment")
+            add(date(y, m, 12), "FINANCE INSTALLMENT - WORKING CAPITAL FACILITY", -18_500, "loan_repayment")
 
     bank = pd.DataFrame(tx).sort_values(["Date", "Amount"], ascending=[True, False]).reset_index(drop=True)
     bank = bank[(bank["Date"] >= START) & (bank["Date"] <= END)].reset_index(drop=True)

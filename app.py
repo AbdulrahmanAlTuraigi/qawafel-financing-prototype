@@ -175,7 +175,10 @@ with tabs[1]:
     st.markdown("**Do the invoices turn into real money?** We compare invoices *including VAT* (customers pay VAT) "
                 "with *customer payments only*, shifted by the payment lag.")
     c1, c2, c3 = st.columns(3)
-    c1.metric("12-month gap (our method)", f"{m['gap_12m']:.1%}")
+    c1.metric("12-month gap (our method)", f"{m['gap_12m']:.1%}",
+              help=f"Payments trail invoices by about {m['payment_lag_months']} month(s). So we compare invoices from the first "
+                   f"{len(mon) - m['payment_lag_months']} months with payments from the last {len(mon) - m['payment_lag_months']} months. "
+                   "The last month's invoices aren't due yet, and the first month's payments are for older invoices.")
     c2.metric("Naive check (net invoices vs all credits)", f"{m['naive_gap']:.1%}")
     c3.metric("Non-sales credits excluded", sar(m["excluded_credits"]))
     st.caption(f"The naive check makes it look like {abs(m['naive_gap']):.0%} *more* money arrived than was invoiced, "
@@ -202,7 +205,7 @@ with tabs[2]:
     st.plotly_chart(fig, use_container_width=True)
     pick = st.selectbox("See a customer's invoices", r.customers.index.tolist())
     ci = r.invoices[(r.invoices["customer"] == pick) & ~r.invoices["is_duplicate"]]
-    st.dataframe(ci[["Invoice No", "issue_date", "Type", "net", "gross", "paid_date", "paid_date_source", "source_row"]],
+    st.dataframe(ci[["Invoice No", "issue_date", "Type", "net", "gross", "paid_date", "paid_date_source", "outstanding", "source_row"]],
                  hide_index=True, use_container_width=True)
 
 with tabs[3]:
@@ -217,13 +220,17 @@ with tabs[3]:
 
 with tabs[4]:
     st.markdown(f"**Can the business afford {sar(amount)} over {term} months?**")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Avg monthly operating cash flow", sar(m["avg_operating_cash_flow"]))
     c2.metric("Existing debt payments / month", sar(m["current_debt_service"]))
     c3.metric("New installment / month", sar(m["new_installment"]))
-    c4.metric("DSCR", f"{m['dscr']:.2f}x")
-    st.caption("DSCR = average monthly operating cash flow ÷ (existing installments + new installment). "
-               "Banks usually want at least 1.25x. Use the sidebar to try a smaller amount or a longer term.")
+    c4.metric("DSCR (12-month average)", f"{m['dscr']:.2f}x")
+    weakest = pd.Period(m["weakest_3m_end"], "M")
+    c5.metric(f"DSCR, weakest 3 months (to {weakest.strftime('%b %Y')})", f"{m['dscr_weakest_3m']:.2f}x")
+    st.caption("DSCR = monthly operating cash flow ÷ (existing installments + new installment). The average can hide a "
+               "weak season, so the weakest 3 months are shown too. Banks usually want at least 1.25x. "
+               "**This is an estimate from bank statements** (customer payments minus suppliers, payroll, rent, "
+               "utilities and VAT), not a verified underwriting ratio. Use the sidebar to try a smaller amount or a longer term.")
     rows = []
     for t in [6, 9, 12, 18, 24, 36]:
         inst = engine.pmt(amount, engine.PROFIT_RATE, t)

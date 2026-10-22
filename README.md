@@ -14,7 +14,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Then open http://localhost:8501. The sample data is already in `data/`. To rebuild it: `python src/generate_data.py` (seeded, so the output is the same every time).
+Then open http://localhost:8501. The sample data is already in `data/`. Run the tests with `pip install pytest && pytest`. To rebuild it: `python src/generate_data.py` (seeded, so the output is the same every time).
 
 Optional: `pip install anthropic` and set `ANTHROPIC_API_KEY` to get a "Write the summary with AI" button for the credit summary. Without it the app uses a rule-based summary. Only computed metrics and flags are sent to the model, never raw invoices or bank lines.
 
@@ -40,22 +40,22 @@ Optional: `pip install anthropic` and set `ANTHROPIC_API_KEY` to get a "Write th
 `src/engine.py` runs these steps:
 
 1. **Clean invoices.** Convert amounts typed as text, drop exact duplicates, recover missing customer names from the VAT number, and merge one customer written several ways (by VAT number, then by normalised name). Each fix is logged with its Excel row.
-2. **Classify bank credits.** Rules on the description separate customer payments from money that is not sales: financing disbursements, owner top-ups, transfers between the company's own accounts, and supplier refunds.
-3. **Match payments to invoices.** First by invoice numbers in the description (SADAD batches list several), then by exact amount within 0 to 150 days. This gives the real payment lag and the open receivables.
+2. **Classify bank lines.** Rules on the description separate customer payments from money that is not sales: financing disbursements, owner top-ups, transfers between the company's own accounts, and supplier refunds. Anything no rule recognises is never counted as a sale, and unknown outgoing payments count as costs, so the numbers err on the cautious side. Both are listed for the analyst.
+3. **Allocate payments to invoices.** A payment that quotes invoice numbers (SADAD batches list several) is split across them, oldest first. An invoice is marked paid only when the money covers what is owed (after credit notes). Partial payments keep the rest open in receivables, and money that can't be allocated is reported, not dropped. Payments without a reference match an unpaid invoice of exactly the same amount issued 0 to 150 days earlier.
 4. **Reconcile.** Compare invoices *including VAT* (customers pay the VAT too) with *customer payments only*, shifted by the payment lag. The gap is checked over 12 months and over rolling 3-month windows.
-5. **Score repayment.** DSCR = average monthly operating cash flow / (existing debt payments + the new installment).
+5. **Estimate repayment capacity.** DSCR = average monthly operating cash flow / (existing debt payments + the new installment), plus the same ratio for the weakest 3 months, because an average hides seasonal dips. It's an estimate from bank statements, not a verified underwriting ratio.
 6. **Flag.** Thresholds turn the metrics into red / amber / green flags.
 
 The Reconciliation tab also shows the naive check (net invoices vs all bank credits, −18.7% here). It suggests more money came in than was invoiced, which would hide fake invoices. That gap is just VAT, the loan, owner money and own-account transfers.
 
 ## The sample company
 
-**Sarab Al Riyadh Food Distribution Co.** is fictional: a Riyadh food wholesaler asking for SAR 1.2M over 12 months to stock up before Ramadan. All names, numbers and IDs are made up. The data was built to tell a story an analyst has to think about:
+**Sarab Al Riyadh Food Distribution Co.** is fictional: a Riyadh food wholesaler asking for SAR 750k over 12 months to stock up before Ramadan. All names, numbers and IDs are made up. The data was built to tell a story an analyst has to think about:
 
 - About SAR 11.3M in yearly sales with a Ramadan peak and a summer dip. The sales reconcile with the bank (12-month gap 1.5%).
 - One restaurant chain stopped paying in April 2026 and owes about SAR 142k (**red**).
 - A SAR 400k financing disbursement shows up in the bank, so the SME already has debt (**amber**).
-- Repayment coverage is 1.11x at 12 months (**amber**), and becomes comfortable (1.46x) at 18 months.
+- Operating cash flow is about SAR 94k a month (a 10% cash margin). Repayment coverage is 1.11x at 12 months (**amber**) and 1.48x at 18 months, but the summer months barely cover the payments, so the analyst may want a seasonal repayment schedule.
 
 The files are messy on purpose, like a real export: three spellings of one customer (one in Arabic), duplicates, missing names, amounts typed as text, missing paid dates, and SADAD batch payments. The "right answers" are in `data/_ground_truth_*.csv` so the cleaner can be checked.
 
@@ -74,6 +74,7 @@ The files are messy on purpose, like a real export: three spellings of one custo
 - The prototype reads CSV/XLSX only. Parsing bank PDFs, open banking, and live accounting connections are out of scope here.
 - The app handles messy *values* (text amounts, duplicates, name variants) but expects this export's column layout. Real uploads need the column-mapping step from Task 1 (risk A1), so there is no upload button.
 - Cash margin is a cash proxy (operating cash flow ÷ net sales), not accounting profit, which would need the SME's financial statements.
+- Amounts are calculated as floating-point numbers and rounded to halalas for display. Production code would store and sum money as fixed decimals (`DECIMAL(14,2)`, as in the technical spec).
 - No login, database or audit trail. In production those come from the platform in the technical spec.
 
 ## Project layout
@@ -85,4 +86,9 @@ src/engine.py          cleaning, classification, matching, metrics, flags
 src/summary.py         rule-based and optional AI credit summary
 src/generate_data.py   builds the fictional sample data
 data/                  sample uploads + ground truth
+tests/test_engine.py   payment allocation, cleaning vs ground truth, repayment maths
 ```
+
+## Tests
+
+`tests/test_engine.py` covers the cases that matter for a lending decision: partial payments, payments split across a batch, overpayments, amount-only matches, and that the cleaner's output matches the ground-truth files (duplicates, text amounts, merged customers, bank classification, operating costs). Writing the tests caught a real bug: suppliers with no keyword in their name were left out of costs, which flattered repayment capacity. Unknown outgoing payments are now counted as costs.

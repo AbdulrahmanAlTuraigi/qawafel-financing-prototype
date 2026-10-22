@@ -40,7 +40,9 @@ CATEGORY_RULES = [          # first match wins; checked on the upper-cased descr
     ("RENT", "rent"),
     ("ZATCA", "tax"),
 ]
-OPERATING_OUT = {"supplier", "payroll", "utilities", "rent", "tax"}
+# Outgoing payments no rule recognises count as operating costs, so repayment capacity is
+# understated rather than flattered. They are listed for the analyst to review.
+OPERATING_OUT = {"supplier", "payroll", "utilities", "rent", "tax", "unclassified_out"}
 
 
 @dataclass
@@ -140,9 +142,19 @@ def classify_bank(raw, opening_balance):
     upper = bank["Description"].str.upper()
     for needle, cat in reversed(CATEGORY_RULES):        # reversed so the first rule wins
         bank.loc[upper.str.contains(needle, regex=False), "category"] = cat
+    unknown_out = (bank["category"] == "other") & (bank["Amount"] < 0)
+    bank.loc[unknown_out, "category"] = "unclassified_out"
     bank["month"] = bank["date"].dt.to_period("M")
 
     log = []
+    if unknown_out.any():
+        names = sorted(bank.loc[unknown_out, "Description"].unique())[:3]
+        log.append(("warn", "C3", f"{unknown_out.sum()} outgoing payments matched no rule (e.g. {', '.join(names)}). "
+                    "Counted as operating costs to be safe; the analyst should confirm them", []))
+    unknown_in = (bank["category"] == "other") & (bank["Amount"] > 0)
+    if unknown_in.any():
+        log.append(("warn", "C3", f"{unknown_in.sum()} incoming payments matched no rule. Not counted as sales; "
+                    "the analyst should confirm them", []))
     # A3: balance continuity, opening + running sum must equal the printed balance
     expected = (opening_balance + bank["Amount"].cumsum()).round(2)
     breaks = (expected - bank["Balance"]).abs() > 0.05
@@ -153,11 +165,20 @@ def classify_bank(raw, opening_balance):
     return bank, log
 
 
+PAID_TOLERANCE = 1.00       # SAR. Rounding differences up to this count as fully paid.
+
+
 def match_payments(inv, bank):
-    """Link customer-payment credits to invoices. Gives every invoice a paid date if we can."""
+    """Allocate customer-payment credits to invoices.
+
+    A payment is split across the invoices it names (oldest first), so an invoice is only
+    marked paid when the money received covers what is owed. Partial payments leave the
+    rest open, and any money that can't be allocated is reported, never silently dropped.
+    """
     inv = inv.copy()
     bank = bank.copy()
     bank["matched_invoices"] = ""
+    bank["allocated"] = 0.0
     live = inv[~inv["is_duplicate"] & ~inv["is_credit_note"]]
     cn = inv[inv["is_credit_note"] & ~inv["is_duplicate"]]
     cn_total = {}
@@ -165,40 +186,61 @@ def match_payments(inv, bank):
         m = re.search(r"INV-\d+", str(r.get("Notes", "")))
         if m:
             cn_total[m.group()] = cn_total.get(m.group(), 0) + r["gross"]
-    expected_amount = {r["Invoice No"]: round(r["gross"] + cn_total.get(r["Invoice No"], 0), 2) for _, r in live.iterrows()}
+    expected = {r["Invoice No"]: round(r["gross"] + cn_total.get(r["Invoice No"], 0), 2) for _, r in live.iterrows()}
+    issue = live.set_index("Invoice No")["issue_date"].to_dict()
+    received = {no: 0.0 for no in expected}      # money allocated to each invoice so far
     paid_on = {}
 
-    pay = bank[bank["category"] == "customer_payment"]
+    def allocate(i, nos, amount, date):
+        """Pay the named invoices oldest first with `amount`. Returns what's left over."""
+        left = amount
+        used = []
+        for no in sorted(nos, key=lambda x: issue[x]):
+            owed = expected[no] - received[no]
+            if owed <= PAID_TOLERANCE or left <= 0:
+                continue
+            take = min(left, owed)
+            received[no] += take
+            left -= take
+            used.append(no)
+            if expected[no] - received[no] <= PAID_TOLERANCE:
+                paid_on[no] = date
+        bank.at[i, "matched_invoices"] = ",".join(used)
+        bank.at[i, "allocated"] = round(amount - left, 2)
+        return left
+
+    pay = bank[bank["category"] == "customer_payment"].sort_values("date")
     # 1) The description quotes invoice numbers (single or batched payments).
     for i, r in pay.iterrows():
-        refs = re.findall(r"INV-\d+", r["Description"])
-        refs = [x for x in refs if x in expected_amount]
+        refs = [x for x in dict.fromkeys(re.findall(r"INV-\d+", r["Description"])) if x in expected]
         if refs:
-            for x in refs:
-                paid_on[x] = r["date"]
-            bank.at[i, "matched_invoices"] = ",".join(refs)
+            allocate(i, refs, r["Amount"], r["date"])
 
-    # 2) No reference: same amount, unpaid invoice issued 0-150 days before the payment.
-    by_amount = {}
-    for no, amt in expected_amount.items():
-        by_amount.setdefault(amt, []).append(no)
-    issue = live.set_index("Invoice No")["issue_date"].to_dict()
+    # 2) No reference: exactly the amount still owed on one unpaid invoice issued 0-150 days before.
     for i, r in pay.iterrows():
         if bank.at[i, "matched_invoices"]:
             continue
-        cands = [n for n in by_amount.get(round(r["Amount"], 2), [])
-                 if n not in paid_on and 0 <= (r["date"] - issue[n]).days <= 150]
+        cands = [n for n in expected
+                 if n not in paid_on and abs(expected[n] - received[n] - r["Amount"]) <= 0.01
+                 and 0 <= (r["date"] - issue[n]).days <= 150]
         if cands:
-            n = min(cands, key=lambda x: issue[x])
-            paid_on[n] = r["date"]
-            bank.at[i, "matched_invoices"] = n
+            allocate(i, [min(cands, key=lambda x: issue[x])], r["Amount"], r["date"])
 
-    inv["matched_paid_date"] = inv["Invoice No"].map(paid_on)
+    bank["unallocated"] = 0.0
+    is_pay = bank["category"] == "customer_payment"
+    bank.loc[is_pay, "unallocated"] = (bank.loc[is_pay, "Amount"] - bank.loc[is_pay, "allocated"]).round(2)
+
+    inv["expected_amount"] = inv["Invoice No"].map(expected)
+    inv["received_from_bank"] = inv["Invoice No"].map(received).fillna(0.0).round(2)
+    inv["matched_paid_date"] = pd.to_datetime(inv["Invoice No"].map(paid_on))
     inv["paid_date"] = inv["file_paid_date"].fillna(inv["matched_paid_date"])
     inv["paid_date_source"] = None
     inv.loc[inv["file_paid_date"].notna(), "paid_date_source"] = "file"
     inv.loc[inv["file_paid_date"].isna() & inv["matched_paid_date"].notna(), "paid_date_source"] = "matched"
     inv.loc[inv["is_credit_note"], "paid_date_source"] = "n/a"
+    # What is still owed. The file's paid date counts as fully paid; otherwise use the bank allocation.
+    inv["outstanding"] = (inv["expected_amount"] - inv["received_from_bank"]).clip(lower=0).round(2)
+    inv.loc[inv["paid_date"].notna() | inv["is_credit_note"] | inv["is_duplicate"], "outstanding"] = 0.0
     return inv, bank
 
 
@@ -263,13 +305,7 @@ def compute(inv, bank, company, amount=None, term=None):
 
     # Receivables aging at the statement date
     as_of = bank["date"].max()
-    cn_by_inv = {}
-    for _, r in live[live["is_credit_note"]].iterrows():
-        mm = re.search(r"INV-\d+", str(r.get("Notes", "")))
-        if mm:
-            cn_by_inv[mm.group()] = cn_by_inv.get(mm.group(), 0) + r["gross"]
-    open_inv = sales[sales["paid_date"].isna()].copy()
-    open_inv["outstanding"] = open_inv["gross"] + open_inv["Invoice No"].map(cn_by_inv).fillna(0)
+    open_inv = sales[sales["outstanding"] > 0].copy()
     open_inv["days_past_due"] = (as_of - open_inv["due_date"]).dt.days
     buckets = pd.cut(open_inv["days_past_due"], [-10_000, 0, 30, 60, 90, 10_000],
                      labels=["Not yet due", "1-30 days", "31-60 days", "61-90 days", "90+ days"])
@@ -284,6 +320,11 @@ def compute(inv, bank, company, amount=None, term=None):
     avg_ocf = float(m["operating_cash_flow"].mean())
     current_debt = float(m["debt_service"].iloc[-3:].mean())
     dscr = avg_ocf / (current_debt + new_installment)
+    # A 12-month average can hide a weak season, so also report the weakest 3 months.
+    ocf_3m = m["operating_cash_flow"].rolling(3).mean()
+    weakest_3m_ocf = float(ocf_3m.min())
+    weakest_3m_end = str(ocf_3m.idxmin())
+    dscr_weakest_3m = weakest_3m_ocf / (current_debt + new_installment)
 
     first3, last3 = m["revenue_net"].iloc[:3].sum(), m["revenue_net"].iloc[-3:].sum()
     # What a naive check would say: net invoices vs every credit, same months, no lag.
@@ -300,7 +341,7 @@ def compute(inv, bank, company, amount=None, term=None):
         "gap_12m": float(gap_12m), "naive_gap": naive_gap,
         "rolling_flagged": int(rolling["flagged"].sum()) if len(rolling) else 0,
         "top5_share": top5, "largest_customer": largest[0], "largest_share": largest[1],
-        "customers": int(len(cust)),
+        "customers": int(len(cust.drop(index="Unknown customer", errors="ignore"))),
         "receivables_open": float(open_inv["outstanding"].sum()),
         "receivables_overdue_60": float(overdue_by_cust.sum()),
         "overdue_by_customer": overdue_by_cust.to_dict(),
@@ -312,6 +353,10 @@ def compute(inv, bank, company, amount=None, term=None):
         "current_debt_service": current_debt,
         "request_amount": amount, "request_term": term,
         "new_installment": new_installment, "dscr": dscr,
+        "dscr_weakest_3m": dscr_weakest_3m, "weakest_3m_end": weakest_3m_end,
+        "unallocated_payments": float(bank["unallocated"].sum()),
+        "unallocated_lines": int((bank["unallocated"] > 0.01).sum()),
+        "partially_paid": int(((sales["received_from_bank"] > 0) & (sales["outstanding"] > 0)).sum()),
         "coverage_months": int((m["invoices_count"] > 0).sum()),
     }
     return m, rolling, cust, aging, metrics
@@ -344,7 +389,9 @@ def build_flags(mt):
         add("red", "Requested amount looks unaffordable",
             f"Cash flow covers debt payments {mt['dscr']:.2f}x (needs at least {DSCR_AMBER}x). Consider a smaller amount or longer term.")
     elif mt["dscr"] < DSCR_AMBER:
-        add("amber", "Repayment capacity is tight", f"Cash flow covers debt payments {mt['dscr']:.2f}x (comfortable is {DSCR_AMBER}x+).")
+        add("amber", "Repayment capacity is tight", f"Cash flow covers debt payments {mt['dscr']:.2f}x on average "
+            f"(comfortable is {DSCR_AMBER}x+), and {mt['dscr_weakest_3m']:.2f}x in the weakest 3 months. This is an estimate "
+            "from bank statements, not a verified underwriting ratio.")
     else:
         add("green", "Repayment capacity is comfortable", f"Cash flow covers debt payments {mt['dscr']:.2f}x.")
 
@@ -367,5 +414,16 @@ def run(invoices_path, bank_path, company_path, amount=None, term=None):
     bank, bank_log = classify_bank(pd.read_csv(bank_path), company["opening_balance"])
     inv, bank = match_payments(inv, bank)
     monthly, rolling, customers, aging, metrics = compute(inv, bank, company, amount, term)
+    match_log = []
+    if metrics["unallocated_lines"]:
+        first = monthly.index.min()
+        early = bank[(bank["unallocated"] > 0.01) & (bank["month"] <= first + 2)]["unallocated"].sum()
+        match_log.append(("info", "C3", f"SAR {metrics['unallocated_payments']:,.0f} of customer payments "
+                          f"({metrics['unallocated_lines']} lines) couldn't be matched to an uploaded invoice. "
+                          f"SAR {early:,.0f} of it arrives in the first 3 months, which fits payments for invoices "
+                          "issued before the uploaded period", []))
+    if metrics["partially_paid"]:
+        match_log.append(("warn", "C3", f"{metrics['partially_paid']} invoices are only partly paid; the rest stays "
+                          "in receivables", []))
     return Results(company, inv, bank, monthly, rolling, customers, aging, metrics,
-                   build_flags(metrics), inv_log + bank_log)
+                   build_flags(metrics), inv_log + bank_log + match_log)
