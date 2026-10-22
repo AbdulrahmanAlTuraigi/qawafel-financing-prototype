@@ -184,6 +184,16 @@ with tabs[1]:
     st.caption(f"The naive check makes it look like {abs(m['naive_gap']):.0%} *more* money arrived than was invoiced, "
                "which would hide fake invoices. That's VAT, the loan, owner money and own-account transfers inflating "
                "the credits.")
+    st.markdown("**How much of the money is tied to specific invoices?** The gap above compares totals. "
+                "This shows how much of the customer money we could actually match to an invoice.")
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Customer payments received", sar(m["customer_payments_total"]))
+    d2.metric(f"Matched to specific invoices ({m['allocated_payments'] / m['customer_payments_total']:.0%})",
+              sar(m["allocated_payments"]))
+    d3.metric(f"Not matched to an uploaded invoice ({m['unallocated_payments'] / m['customer_payments_total']:.0%})",
+              sar(m["unallocated_payments"]))
+    st.caption("Unmatched money is not proof of sales. Here most of it arrives in the first months, which fits payments "
+               "for invoices issued before the uploaded period, but the analyst should confirm it (see Data quality).")
     roll = r.rolling.copy()
     fig = go.Figure()
     fig.add_bar(x=roll["window"], y=roll["invoices_shifted"], name="Invoices due in window (incl. VAT)", marker_color=MUTED)
@@ -205,7 +215,7 @@ with tabs[2]:
     st.plotly_chart(fig, use_container_width=True)
     pick = st.selectbox("See a customer's invoices", r.customers.index.tolist())
     ci = r.invoices[(r.invoices["customer"] == pick) & ~r.invoices["is_duplicate"]]
-    st.dataframe(ci[["Invoice No", "issue_date", "Type", "net", "gross", "paid_date", "paid_date_source", "outstanding", "source_row"]],
+    st.dataframe(ci[["Invoice No", "issue_date", "Type", "net", "gross", "paid_date", "paid_date_source", "payment_status", "outstanding", "source_row"]],
                  hide_index=True, use_container_width=True)
 
 with tabs[3]:

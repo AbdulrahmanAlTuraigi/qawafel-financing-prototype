@@ -238,9 +238,16 @@ def match_payments(inv, bank):
     inv.loc[inv["file_paid_date"].notna(), "paid_date_source"] = "file"
     inv.loc[inv["file_paid_date"].isna() & inv["matched_paid_date"].notna(), "paid_date_source"] = "matched"
     inv.loc[inv["is_credit_note"], "paid_date_source"] = "n/a"
-    # What is still owed. The file's paid date counts as fully paid; otherwise use the bank allocation.
+    # What is still owed follows the bank, not the SME's file: a "Paid Date" in the upload is the
+    # SME's claim, and money we can see arriving is the evidence. The two are kept apart.
     inv["outstanding"] = (inv["expected_amount"] - inv["received_from_bank"]).clip(lower=0).round(2)
-    inv.loc[inv["paid_date"].notna() | inv["is_credit_note"] | inv["is_duplicate"], "outstanding"] = 0.0
+    inv.loc[inv["is_credit_note"] | inv["is_duplicate"], "outstanding"] = 0.0
+    sale = ~inv["is_credit_note"] & ~inv["is_duplicate"]
+    inv["payment_status"] = None
+    inv.loc[sale, "payment_status"] = "open"
+    inv.loc[sale & (inv["received_from_bank"] > 0), "payment_status"] = "partly paid (bank)"
+    inv.loc[sale & inv["file_paid_date"].notna() & (inv["outstanding"] > 0), "payment_status"] = "SME says paid, bank shows less"
+    inv.loc[sale & (inv["outstanding"] == 0), "payment_status"] = "paid (bank confirmed)"
     return inv, bank
 
 
@@ -356,7 +363,9 @@ def compute(inv, bank, company, amount=None, term=None):
         "dscr_weakest_3m": dscr_weakest_3m, "weakest_3m_end": weakest_3m_end,
         "unallocated_payments": float(bank["unallocated"].sum()),
         "unallocated_lines": int((bank["unallocated"] > 0.01).sum()),
-        "partially_paid": int(((sales["received_from_bank"] > 0) & (sales["outstanding"] > 0)).sum()),
+        "partially_paid": int((sales["payment_status"] == "partly paid (bank)").sum()),
+        "customer_payments_total": float(bank.loc[bank["category"] == "customer_payment", "Amount"].sum()),
+        "allocated_payments": float(bank["allocated"].sum()),
         "coverage_months": int((m["invoices_count"] > 0).sum()),
     }
     return m, rolling, cust, aging, metrics
@@ -422,6 +431,11 @@ def run(invoices_path, bank_path, company_path, amount=None, term=None):
                           f"({metrics['unallocated_lines']} lines) couldn't be matched to an uploaded invoice. "
                           f"SAR {early:,.0f} of it arrives in the first 3 months, which fits payments for invoices "
                           "issued before the uploaded period", []))
+    conflict = inv[inv["payment_status"] == "SME says paid, bank shows less"]
+    if len(conflict):
+        match_log.append(("warn", "C3", f"{len(conflict)} invoices are marked paid in the file, but the bank shows "
+                          f"SAR {conflict['outstanding'].sum():,.0f} less than owed. They stay in receivables until "
+                          "the SME shows the payment", conflict["source_row"].tolist()))
     if metrics["partially_paid"]:
         match_log.append(("warn", "C3", f"{metrics['partially_paid']} invoices are only partly paid; the rest stays "
                           "in receivables", []))

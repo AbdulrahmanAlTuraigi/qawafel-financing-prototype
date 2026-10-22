@@ -86,6 +86,40 @@ def test_amount_match_needs_exact_amount_and_time_window():
     assert list(bank["unallocated"]) == [0, 2_299, 4_600]
 
 
+def test_sme_paid_date_does_not_override_the_bank():
+    # The SME's file says paid, but only SAR 1,000 of SAR 100,000 reached the bank.
+    inv = invoices(("INV-1", "2026-01-01", 100_000))
+    inv["file_paid_date"] = pd.Timestamp("2026-02-01")
+    inv, _ = engine.match_payments(inv, payments(("2026-02-01", "TRF REF INV-1", 1_000)))
+    row = inv.set_index("Invoice No").loc["INV-1"]
+    assert row["outstanding"] == 99_000
+    assert row["payment_status"] == "SME says paid, bank shows less"
+
+
+def test_same_amount_invoices_are_paid_oldest_first():
+    inv, _ = engine.match_payments(
+        invoices(("INV-NEW", "2026-01-20", 2_300), ("INV-OLD", "2026-01-05", 2_300)),
+        payments(("2026-02-01", "CASH DEPOSIT", 2_300)))
+    s = status(inv)
+    assert s.loc["INV-OLD", "outstanding"] == 0
+    assert s.loc["INV-NEW", "outstanding"] == 2_300
+
+
+def test_credit_note_reduces_what_is_owed():
+    inv = pd.concat([invoices(("INV-1", "2026-01-01", 1_150)),
+                     invoices(("CN-1", "2026-01-10", -115)).assign(is_credit_note=True, Notes="Return against INV-1")])
+    inv, _ = engine.match_payments(inv, payments(("2026-02-01", "TRF REF INV-1", 1_035)))
+    assert status(inv).loc["INV-1", "outstanding"] == 0
+
+
+def test_zero_payment_pays_nothing():
+    inv, bank = engine.match_payments(
+        invoices(("INV-1", "2026-01-01", 500)),
+        payments(("2026-02-01", "TRF REF INV-1", 0)))
+    assert status(inv).loc["INV-1", "outstanding"] == 500
+    assert bank.loc[0, "allocated"] == 0
+
+
 def test_never_allocates_more_than_was_received():
     r = engine.run(*_sample_paths())
     pay = r.bank[r.bank["category"] == "customer_payment"]
