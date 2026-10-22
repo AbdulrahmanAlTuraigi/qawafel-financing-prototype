@@ -2,6 +2,8 @@
 
 A working prototype of the screen a **bank credit analyst** uses to decide on a financing request from an SME wholesaler on Qawafel. It reads the SME's raw uploads (an invoice export and bank transactions), cleans them, checks that the invoices are backed by real money in the bank, and shows the numbers a credit decision needs, with every number traceable back to a row in the original files.
 
+**Live demo:** https://appwafel-financing-prototype-3354ktx5lpjuh8zk9dpp6r.streamlit.app (no install needed; if it shows "app is asleep", click to wake it, about 30 seconds)
+
 ![Overview](docs/overview.png)
 
 ## Run it
